@@ -55,8 +55,11 @@ spec:
       value: "4.21"
     - name: OPERATOR_CHANNEL
       value: gitops-1.20
+    # channel-1.20 only, not the nightly automation's release-1.20: on 2026-11-04 the nightly PRs
+    # #388-#390 started all 16 release scenarios at once, and 23 of their 32 legs timed
+    # out waiting for a cluster from the 2-cluster pools. Label a PR or Snapshot by hand.
     - name: GATE_LABEL
-      value: "channel-1.20|release-1.20"
+      value: "channel-1.20"
     # aws-421-fips: OpenShift 4.21 with FIPS on, on AWS -- the FIPS configuration
     # in the release test plan (pools/aws-421-fips in hive-ops: gcp-421-fips's configuration
     # on AWS). It keeps no cluster waiting, so each leg's claim gets a cluster installed for
