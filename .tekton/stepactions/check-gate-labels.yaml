@@ -13,8 +13,10 @@ spec:
     for the step to emit proceed=true. Alternatives are separated by "|":
     "channel-1.22|release-1.22" proceeds on either label, and
     "release-1.22,nightly|channel-1.22" on both of the first two or on the
-    third. The nightly-catalog automation labels its PRs release-X.Y, so
-    this lets the release tier take those without relabelling.
+    third. The nightly-catalog automation labels its PRs release-X.Y. The
+    release tier used to accept that label too, and stopped on 2026-11-04:
+    one nightly started every release scenario at once, far more legs than
+    the Hive pools have clusters.
 
     Push events (GitHub answers that no PR contains the commit) proceed
     regardless of labels, unless require-pr is "true". An empty GATE_LABELS
