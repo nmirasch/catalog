@@ -29,6 +29,16 @@ set -euo pipefail
 #
 # Flags: --namespace NS --argocd-image IMG --argocd-version vX.Y.Z --no-deploy
 #        --pull-secret FILE --recompile --timeout 60m --gpg --openshift-tests
+#        --argocd-cli-image IMG|auto|server
+#
+# The argocd CLI the fixture shells out to is, by default, the one customers download: the
+# linux tarball in the release's argocd-cli image, found through the release repo's candidate
+# snapshot that ships the Argo CD image under test (see shipped_cli_image). It is a separate
+# build from the argocd in the server image -- `make argocd-all` against the server image's
+# CGO/strictfipsruntime build -- so testing the server's copy says nothing about the binary we
+# ship. `server` keeps the server image's copy, an image ref skips the lookup, and when the
+# lookup finds nothing (a nightly build, a hand-built image) the server's copy is used and
+# the run says so. ARGOCD_CLI_IMAGE sets the same thing.
 #
 # The suite runs in a pod on the cluster because it has to: the fixture pushes fixtures to,
 # and points Argo CD at, in-cluster service names, so from a laptop every test fails in
@@ -72,6 +82,8 @@ SKIP_GPG="${ARGOCD_E2E_SKIP_GPG:-true}"
 SKIP_OPENSHIFT="${ARGOCD_E2E_SKIP_OPENSHIFT:-auto}"
 PULL_SECRET=argocd-e2e-pull-secret PULL_SECRET_READY=false
 TIMEOUT="${ARGOCD_E2E_TEST_TIMEOUT:-60m}"
+CLI_IMAGE="${ARGOCD_CLI_IMAGE:-auto}"
+RELEASE_REPO="${RELEASE_REPO:-rh-gitops-midstream/release}"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 say() { echo; echo "=== $*"; }
@@ -99,6 +111,7 @@ while [[ $# -gt 0 ]]; do
     --argocd-version)  VERSION="$2"; shift 2 ;;
     --pull-secret)     PULL_SECRET_FILE="$2"; shift 2 ;;
     --timeout)         TIMEOUT="$2"; shift 2 ;;
+    --argocd-cli-image) CLI_IMAGE="$2"; shift 2 ;;
     --no-deploy)       NO_DEPLOY=true; shift ;;
     --recompile)       RECOMPILE=true; shift ;;
     --gpg)             SKIP_GPG=false; shift ;;
@@ -256,6 +269,95 @@ EOF
   fi
   oc delete pod "$p" -n "$NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   return $rc
+}
+
+# The argocd-cli image released alongside the Argo CD image under test, or nothing.
+#
+# Nothing on the cluster names it: the CLI is not part of the bundle. The release repo does.
+# Each release candidate's snapshot.yaml lists every image of that build by digest, and the
+# digest survives the copy from Konflux's quay to registry.redhat.io, so the candidate whose
+# snapshot carries ${IMAGE}'s digest is the build under test, and its argocd-cli entry is the
+# CLI that build ships. Matched on the Argo CD image rather than the operator's so that a
+# --argocd-image run gets the CLI of the image it actually deploys.
+shipped_cli_image() {
+  local img="$IMAGE" digest csv ver branch auth=() c snap cli
+  [[ -n "$img" ]] || img=$(oc get deploy argocd-server -n "$NS" \
+                             -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+  digest="${img##*@}"
+  if [[ "$digest" != sha256:* ]]; then
+    echo "  ${img:-no image}: not pinned by digest, so no release candidate can be matched" >&2
+    return 0
+  fi
+  csv=$(oc get csv -n "$OPERATOR_NS" -o name 2>/dev/null | grep -i gitops | head -1 || true)
+  [[ -z "$csv" ]] || ver=$(oc get "$csv" -n "$OPERATOR_NS" -o jsonpath='{.spec.version}' 2>/dev/null || true)
+  if [[ ! "${ver:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "  no GitOps CSV version in ${OPERATOR_NS} to find the release by" >&2
+    return 0
+  fi
+  branch="release-${ver%.*}"
+  # One API call, for the listing; the snapshots come from raw.githubusercontent.com, which
+  # has no rate limit. Anonymous allows 60 calls an hour, so a token is used when there is one.
+  [[ -z "${GITHUB_TOKEN:-}" ]] || auth=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+  for c in $(curl -fsSL "${auth[@]}" \
+               "https://api.github.com/repos/${RELEASE_REPO}/contents/releases/${ver}/candidates?ref=${branch}" \
+               2>/dev/null | jq -r '.[]?.name' | sort -rV); do
+    snap=$(curl -fsSL "https://raw.githubusercontent.com/${RELEASE_REPO}/${branch}/releases/${ver}/candidates/${c}/snapshot.yaml" \
+             2>/dev/null || true)
+    [[ "$snap" == *"$digest"* ]] || continue
+    # An entry is "- containerImage: X" followed by "name: argocd-cli-1-22".
+    cli=$(awk '/containerImage:/ {i = $NF} /name: argocd-cli-/ {print i; exit}' <<<"$snap")
+    if [[ -n "$cli" ]]; then
+      echo "  release candidate ${c} ships ${digest:7:12}; its CLI is ${cli}" >&2
+      echo "$cli"
+      return 0
+    fi
+  done
+  echo "  no candidate of ${ver} in ${RELEASE_REPO} (${branch}) ships ${digest:7:12}" >&2
+}
+
+# Puts the shipped linux CLI in the runner as /tmp/rc-argocd/argocd, replacing the server
+# image's copy, so the fixture's every `argocd` call runs the binary customers download.
+# A lookup that finds nothing falls back to the server image's copy and says so. A CLI that
+# was found but cannot be extracted or does not run fails setup: that is a broken artifact,
+# or no answer to the question this is asking.
+install_shipped_cli() {
+  local img="$CLI_IMAGE" A tmp want got attempt v
+  if [[ "$img" == server ]]; then
+    echo "  argocd: the server image's copy (--argocd-cli-image server)"
+    return 0
+  fi
+  [[ "$img" != auto ]] || img=$(shipped_cli_image)
+  if [[ -z "$img" ]]; then
+    echo "  WARNING: no shipped argocd CLI found -- the fixture runs the server image's argocd instead"
+    return 0
+  fi
+  case "$(oc exec -n "$NS" "$POD" -- uname -m)" in
+    x86_64) A=amd64 ;; aarch64) A=arm64 ;; *) A=$(oc exec -n "$NS" "$POD" -- uname -m) ;;
+  esac
+  tmp=$(mktemp -d)
+  # The tarball, not the 220MB binary, crosses to the runner: a third of the bytes over the
+  # one hop that has corrupted copies before (see above).
+  oc image extract "$img" --path "/releases/argocd-linux-${A}.tar.gz:${tmp}" --confirm >/dev/null \
+    || { rm -rf "$tmp"; die "could not extract /releases/argocd-linux-${A}.tar.gz from ${img}"; }
+  want=$(md5sum "${tmp}/argocd-linux-${A}.tar.gz" | cut -d' ' -f1)
+  for attempt in 1 2 3; do
+    oc exec -i -n "$NS" "$POD" -- bash -c "cat > /tmp/rc-argocd/cli.tar.gz" < "${tmp}/argocd-linux-${A}.tar.gz" || true
+    got=$(oc exec -n "$NS" "$POD" -- md5sum /tmp/rc-argocd/cli.tar.gz 2>/dev/null | cut -d' ' -f1) || true
+    [[ "$got" == "$want" ]] && break
+    echo "  CLI tarball copy ${attempt}/3 arrived corrupt (md5 ${got:-none}, want ${want})"
+    got=
+  done
+  rm -rf "$tmp"
+  [[ -n "$got" ]] || die "could not copy the argocd CLI tarball into ${POD} intact"
+  oc exec -n "$NS" "$POD" -- bash -c "set -e; cd /tmp/rc-argocd; tar -xzf cli.tar.gz; \
+    mv -f argocd-linux-${A} argocd; chmod +x argocd; rm -f cli.tar.gz"
+  v=$(oc exec -n "$NS" "$POD" -- /tmp/rc-argocd/argocd version --client --short 2>&1) \
+    || die "the shipped argocd CLI does not run in ${POD}: ${v}"
+  echo "  argocd: ${img} (${v})"
+  # The suite is compiled from ${VERSION}'s tag. A CLI of another version still runs it, but
+  # then the failures are a version skew, not a defect, so it is called out up front.
+  [[ -z "$VERSION" || "$v" == *"${VERSION}"* ]] \
+    || echo "  WARNING: the shipped CLI is ${v} but the suite is compiled for ${VERSION}"
 }
 
 # OpenShift's cluster-wide pull secret already covers registry.redhat.io, so there this only
@@ -598,6 +700,9 @@ EOF
     echo "  ${b}: ${src}"
   done
 
+  say "Replacing argocd with the shipped CLI"
+  install_shipped_cli
+
   push_runner_script
 }
 
@@ -647,12 +752,16 @@ if [[ ! -f $SRC/e2e.test ]]; then
   kill $HB 2>/dev/null
   [[ $rc -eq 0 ]] || { echo "ERROR: compile failed"; exit 1; }
   mkdir -p dist
-  if [[ -x /tmp/rc-argocd/argocd ]]; then
-    cp /tmp/rc-argocd/argocd dist/argocd
-  else
+  if [[ ! -x /tmp/rc-argocd/argocd ]]; then
     go build -ldflags "-X ${MOD}/common.version=${V}" -o dist/argocd ./cmd || exit 1
   fi
 fi
+# Outside the compile, so a setup that swaps the CLI (--argocd-cli-image) reaches a pod whose
+# suite is already compiled.
+if [[ -x /tmp/rc-argocd/argocd ]] && ! cmp -s /tmp/rc-argocd/argocd "$SRC/dist/argocd"; then
+  mkdir -p "$SRC/dist" && cp -f /tmp/rc-argocd/argocd "$SRC/dist/argocd"
+fi
+echo "argocd CLI: $("$SRC/dist/argocd" version --client --short 2>&1 | head -1)"
 
 # --- helm and kustomize -------------------------------------------------------------
 # The ones bundled in the Argo CD image win. Upstream's pins in hack/tool-versions.sh only
