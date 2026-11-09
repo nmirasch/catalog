@@ -23,14 +23,15 @@ def write_yaml_file(path, data):
         yaml.dump(data, f)
 
 
-def load_catalog_templates(supported_ocp):
+def load_catalog_templates():
+    """Discover available OCP versions from the catalog/ directory:
+    a version exists if catalog/<ocp>/template.yaml exists."""
     templates = {}
-    for ocp in supported_ocp:
-        path = CATALOG_DIR / ocp / "template.yaml"
-        if not path.exists():
-            print(f"Missing template for {ocp}")
-            sys.exit(1)
-        templates[ocp] = path
+    for path in sorted(CATALOG_DIR.glob("*/template.yaml")):
+        templates[path.parent.name] = path
+    if not templates:
+        print(f"No catalog templates found in {CATALOG_DIR}")
+        sys.exit(1)
     return templates
 
 
@@ -139,16 +140,16 @@ def latest_y_stream_channel(channels):
 
 def main():
     config = load_yaml_file(CONFIG_FILE)
-    supported_ocp = config.get("supportedOCP", [])
     channels = config.get("channels", [])
 
-    templates = load_catalog_templates(supported_ocp)
+    templates = load_catalog_templates()
+    available_ocp = set(templates)
     allowed_images = {path: set() for path in templates.values()}
 
     def channel_supported_ocp(channel):
         # Channels without an explicit supportedOCP list are published
-        # to every catalog version.
-        return channel.get("supportedOCP", supported_ocp)
+        # to every available catalog version.
+        return channel.get("supportedOCP", available_ocp)
 
     def latest_supported_channel(ocp):
         supported = [
