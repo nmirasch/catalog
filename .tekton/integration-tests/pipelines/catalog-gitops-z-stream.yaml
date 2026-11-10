@@ -91,6 +91,15 @@ spec:
         carrying both sequential shards runs about 3h30m; one carrying everything, about
         6h. The pool caps claims at 8h.
       default: "6h"
+    - name: MIN_WORKERS
+      type: string
+      description: >-
+        Ready worker nodes each leg's cluster must have before the operator is installed,
+        passed to hive-suite-leg's minWorkers. "3" matches the 3+3 pools. A single-node
+        pool (aws-422-sno) needs "1": its one node carries the worker role, and at "3" the
+        leg waits 30 minutes, gives the cluster back and runs nothing. "0" turns the check
+        off.
+      default: "3"
     - name: HIVE_HUB_SECRET
       type: string
       default: hive-hub-kubeconfig
@@ -269,6 +278,8 @@ spec:
           value: $(params.POOL_NAMESPACE)
         - name: claimLifetime
           value: $(params.CLAIM_LIFETIME)
+        - name: minWorkers
+          value: $(params.MIN_WORKERS)
         - name: openshiftVersion
           value: $(params.OPENSHIFT_VERSION)
         - name: operatorChannel
