@@ -160,7 +160,9 @@ git checkout -B "${BRANCH}" "origin/${BRANCH}"
 source /usr/local/bin/go-cache.sh
 go_cache_pull "operator-${BRANCH}"
 
-GINKGO_ARGS=()
+# Upstream labels non-OpenShift (xKS) specs "xks" and filters them out of OpenShift runs
+# in its Makefile (OCP_LABEL_FILTER). We call ginkgo directly, so filter them here too.
+GINKGO_ARGS=("--label-filter=${GINKGO_LABEL_FILTER:-!xks}")
 if [[ -n "${GINKGO_SKIP:-}" ]]; then
   GINKGO_ARGS+=("--skip=${GINKGO_SKIP}")
   echo "Skipping tests matching: ${GINKGO_SKIP}"
