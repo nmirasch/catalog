@@ -56,7 +56,7 @@ spec:
         echo -n "${COMMIT_SHA}" > /workspace/source/COMMIT_SHA
 
     - name: check-cache
-      image: quay.io/skopeo/stable:latest
+      image: quay.io/skopeo/stable:v1.22.3@sha256:2681eccb8b02c495b013c2669cbf7f41d5c0b0b0e644e7c69bd3ea9bcb20641f
       volumeMounts:
         - name: source
           mountPath: /workspace/source
@@ -93,7 +93,9 @@ spec:
         fi
 
     - name: build-overlay
-      image: quay.io/buildah/stable:latest
+      # Pinned: buildah 1.45 mounts an overlay over the build context, which fails in
+      # Konflux pods ("mount overlay ... userxattr: invalid", exit 125). Check that before bumping.
+      image: quay.io/buildah/stable:v1.43.5@sha256:a6f96bfffc47f36462985573d85e87f782bf2d8b37e02cb3dd307713bfa6cc13
       volumeMounts:
         - name: source
           mountPath: /workspace/source
