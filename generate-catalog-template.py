@@ -143,13 +143,10 @@ def main():
     channels = config.get("channels", [])
 
     templates = load_catalog_templates()
-    available_ocp = set(templates)
     allowed_images = {path: set() for path in templates.values()}
 
     def channel_supported_ocp(channel):
-        # Channels without an explicit supportedOCP list are published
-        # to every available catalog version.
-        return channel.get("supportedOCP", available_ocp)
+        return channel.get("supportedOCP")
 
     def latest_supported_channel(ocp):
         supported = [
